@@ -201,9 +201,6 @@ def dense_retrieve(query_str: str, size: int = 50, num_candidates: int = 200):
     return es.search(index=ES_INDEX, knn=knn)
 
 def merge_hits(bm25_hits, knn_hits, limit: int = 100) -> List[Dict[str, Any]]:
-    """
-    bm25 + knn 결과를 chunk_id 기준으로 합치기 (중복 제거)
-    """
     merged = {}
     for h in bm25_hits:
         cid = h["_source"].get("chunk_id")
@@ -223,11 +220,7 @@ def merge_hits(bm25_hits, knn_hits, limit: int = 100) -> List[Dict[str, Any]]:
 # =========================
 # 5) Reranker (CrossEncoder)
 # =========================
-def rerank(query: str, hits: List[Dict[str, Any]], topn: int = 20) -> List[Tuple[float, Dict[str, Any]]]:
-    """
-    hits: ES hit list (chunk 단위)
-    return: [(rerank_score, hit), ...] 상위 topn
-    """
+def rerank(query: str, hits: List[Dict[str, Any]], topn: int = 30) -> List[Tuple[float, Dict[str, Any]]]:
     pairs = [(query, h["_source"]["content"]) for h in hits]
     if not pairs:
         return []
@@ -237,13 +230,7 @@ def rerank(query: str, hits: List[Dict[str, Any]], topn: int = 20) -> List[Tuple
     scored.sort(key=lambda x: x[0], reverse=True)
     return scored[:topn]
 
-
 def select_topk_docids(scored_hits: List[Tuple[float, Dict[str, Any]]], k_doc: int = 3) -> Tuple[List[str], List[Dict[str, Any]]]:
-    """
-    청킹된 결과를 docid 단위로 묶어서 상위 docid k개를 선택.
-    - doc별 최고 rerank score를 대표 점수로 사용
-    - references에는 실제로 선택된 chunk content 포함
-    """
     best_by_doc = {}
     best_chunk_by_doc = {}
 
@@ -345,7 +332,7 @@ tools = [
 # =========================
 # 7) RAG 파이프라인 (Hybrid + Rerank)
 # =========================
-def hybrid_search_with_rerank(query: str, k_final: int = 5, bm25_k: int = 50, knn_k: int = 50) -> Tuple[List[str], List[Dict[str, Any]]]:
+def hybrid_search_with_rerank(query: str, k_final: int = 10, bm25_k: int = 50, knn_k: int = 50) -> Tuple[List[str], List[Dict[str, Any]]]:
     bm25 = sparse_retrieve(query, size=bm25_k)
     knn = dense_retrieve(query, size=knn_k)
 

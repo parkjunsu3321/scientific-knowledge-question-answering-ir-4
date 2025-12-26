@@ -45,14 +45,8 @@ print(es.info())
 # 1) Chunking
 # =========================
 def chunk_text(text: str, chunk_size: int = 700, chunk_overlap: int = 150) -> List[str]:
-    """
-    간단한 문자 기반 청킹.
-    - chunk_size / chunk_overlap: "문자 기준" (언어 불문 안정적으로 동작)
-    - 너무 짧은 chunk는 제거
-    """
     if not text:
         return []
-
     text = text.strip()
     if len(text) <= chunk_size:
         return [text]
@@ -67,26 +61,20 @@ def chunk_text(text: str, chunk_size: int = 700, chunk_overlap: int = 150) -> Li
         if end == len(text):
             break
         start = max(0, end - chunk_overlap)
-
     return chunks
 
 
 def make_chunk_docs(docs: List[Dict[str, Any]], chunk_size: int = 700, chunk_overlap: int = 150) -> List[Dict[str, Any]]:
-    """
-    입력 docs(원문) -> chunk 단위 docs로 변환
-    documents.jsonl 각 라인에 최소한 {"docid":..., "content":...} 가 있다고 가정
-    """
     chunked = []
     for d in docs:
         docid = d.get("docid")
         content = d.get("content", "")
         chunks = chunk_text(content, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
-
         for ci, c in enumerate(chunks):
             chunked.append({
-                "docid": docid,                 # 원문 doc id 유지
-                "chunk_id": f"{docid}_{ci}",     # chunk 식별자
-                "content": c                    # ES 검색 대상은 chunk content
+                "docid": docid,
+                "chunk_id": f"{docid}_{ci}",
+                "content": c
             })
     return chunked
 
@@ -101,10 +89,6 @@ def e5_query(text: str) -> str:
     return f"query: {text}"
 
 def get_embedding_passages(passages: List[str]) -> List[List[float]]:
-    """
-    E5 계열은 query/passage prefix 권장 + cosine 유사도 권장
-    normalize_embeddings=True 로 코사인 최적화
-    """
     vecs = embed_model.encode(
         [e5_passage(p) for p in passages],
         normalize_embeddings=True,
@@ -129,7 +113,6 @@ def get_embeddings_in_batches(docs: List[Dict[str, Any]], batch_size: int = 128)
         all_vecs.extend(vecs)
         print(f"embedding batch {i} ~ {i+len(batch)}")
     return all_vecs
-
 
 # =========================
 # 3) ES 인덱스/색인
@@ -178,72 +161,84 @@ def bulk_add(index: str, docs: List[Dict[str, Any]]) -> Any:
 
 
 # =========================
-# 4) 검색 (BM25 + KNN 후보 생성)
+# 4) 검색 (BM25 + KNN 후보 생성) + ✅ RRF 결합
 # =========================
 def sparse_retrieve(query_str: str, size: int = 50):
-    query = {
-        "match": {
-            "content": {
-                "query": query_str
-            }
-        }
-    }
+    query = {"match": {"content": {"query": query_str}}}
     return es.search(index=ES_INDEX, query=query, size=size, sort="_score")
 
 def dense_retrieve(query_str: str, size: int = 50, num_candidates: int = 200):
     query_vec = get_embedding_query(query_str)
-    knn = {
-        "field": "embeddings",
-        "query_vector": query_vec,
-        "k": size,
-        "num_candidates": num_candidates
-    }
+    knn = {"field": "embeddings", "query_vector": query_vec, "k": size, "num_candidates": num_candidates}
     return es.search(index=ES_INDEX, knn=knn)
 
-def merge_hits(bm25_hits, knn_hits, limit: int = 100) -> List[Dict[str, Any]]:
-    """
-    bm25 + knn 결과를 chunk_id 기준으로 합치기 (중복 제거)
-    """
-    merged = {}
-    for h in bm25_hits:
-        cid = h["_source"].get("chunk_id")
-        if cid and cid not in merged:
-            merged[cid] = h
-    for h in knn_hits:
-        cid = h["_source"].get("chunk_id")
-        if cid and cid not in merged:
-            merged[cid] = h
+def _chunk_id_from_hit(hit: Dict[str, Any]) -> str:
+    src = hit.get("_source", {})
+    return str(src.get("chunk_id", ""))
 
-    # (초기 후보는 ES score 기반으로 대충 정렬해서 limit로 자름)
-    cand = list(merged.values())
-    cand.sort(key=lambda x: (x.get("_score", 0.0)), reverse=True)
-    return cand[:limit]
+def rrf_merge_hits(
+    bm25_hits: List[Dict[str, Any]],
+    knn_hits: List[Dict[str, Any]],
+    limit: int = 120,
+    k: int = 60,
+    w_bm25: float = 1.0,
+    w_knn: float = 1.0
+) -> List[Dict[str, Any]]:
+    """
+    ✅ RRF(Reciprocal Rank Fusion)
+    score(d) = w_bm25/(k + rank_bm25(d)) + w_knn/(k + rank_knn(d))
+
+    - rank는 1부터 시작
+    - k는 보통 60(안정화 상수)
+    - w_*는 원하면 가중치 줄 수 있는데, 기본은 동일(1.0)
+    """
+    scores: Dict[str, float] = {}
+    hit_map: Dict[str, Dict[str, Any]] = {}
+
+    # BM25 ranks
+    for i, h in enumerate(bm25_hits):
+        cid = _chunk_id_from_hit(h)
+        if not cid:
+            continue
+        hit_map[cid] = h
+        rank = i + 1
+        scores[cid] = scores.get(cid, 0.0) + (w_bm25 / (k + rank))
+
+    # KNN ranks
+    for i, h in enumerate(knn_hits):
+        cid = _chunk_id_from_hit(h)
+        if not cid:
+            continue
+        hit_map.setdefault(cid, h)
+        rank = i + 1
+        scores[cid] = scores.get(cid, 0.0) + (w_knn / (k + rank))
+
+    # RRF 점수로 정렬 후 top limit
+    ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+    merged_hits = []
+    for cid, rrf_score in ranked[:limit]:
+        h = hit_map[cid]
+        # 디버깅/분석용: RRF 점수 저장(선택)
+        h["_rrf_score"] = float(rrf_score)
+        merged_hits.append(h)
+
+    return merged_hits
 
 
 # =========================
 # 5) Reranker (CrossEncoder)
 # =========================
 def rerank(query: str, hits: List[Dict[str, Any]], topn: int = 20) -> List[Tuple[float, Dict[str, Any]]]:
-    """
-    hits: ES hit list (chunk 단위)
-    return: [(rerank_score, hit), ...] 상위 topn
-    """
     pairs = [(query, h["_source"]["content"]) for h in hits]
     if not pairs:
         return []
-
-    scores = reranker.predict(pairs)  # numpy array
+    scores = reranker.predict(pairs)
     scored = list(zip(scores.tolist(), hits))
     scored.sort(key=lambda x: x[0], reverse=True)
     return scored[:topn]
 
 
 def select_topk_docids(scored_hits: List[Tuple[float, Dict[str, Any]]], k_doc: int = 3) -> Tuple[List[str], List[Dict[str, Any]]]:
-    """
-    청킹된 결과를 docid 단위로 묶어서 상위 docid k개를 선택.
-    - doc별 최고 rerank score를 대표 점수로 사용
-    - references에는 실제로 선택된 chunk content 포함
-    """
     best_by_doc = {}
     best_chunk_by_doc = {}
 
@@ -263,7 +258,6 @@ def select_topk_docids(scored_hits: List[Tuple[float, Dict[str, Any]]], k_doc: i
     doc_sorted = sorted(best_by_doc.items(), key=lambda x: x[1], reverse=True)
     top_docids = [d for d, _ in doc_sorted[:k_doc]]
     references = [best_chunk_by_doc[d] for d in top_docids]
-
     return top_docids, references
 
 
@@ -271,54 +265,20 @@ def select_topk_docids(scored_hits: List[Tuple[float, Dict[str, Any]]], k_doc: i
 # 6) LLM 프롬프트/도구 정의
 # =========================
 persona_qa = """
-## Role: 지식 전문가 (Search-grounded QA)
-
-## Core Principle (가장 중요)
-- 모든 답변은 반드시 search API를 통해 얻은 검색 결과에만 기반해야 한다.
-- 검색 결과에 포함되지 않은 내용은 절대로 추론하거나 보완해서 사용하지 않는다.
-- LLM의 사전 학습 지식, 일반 상식, 암묵적 배경지식 사용을 엄격히 금지한다.
+## Role: 과학 상식 전문가
 
 ## Instructions
-1. 사용자의 질문에 답변하기 전에, 반드시 search API 결과를 확인하고 그 내용만을 사용한다.
-2. 검색 결과에서 직접적으로 확인 가능한 정보만 요약·재구성하여 답변한다.
-3. 검색 결과에 없는 정보는 다음과 같이 답변한다:
-   - "제공된 검색 결과만으로는 해당 질문에 대한 정보를 확인할 수 없습니다."
-4. 추측, 일반화, 보완 설명, 추가 배경 설명을 하지 않는다.
-5. 수치, 날짜, 고유명사, 원인-결과 관계는 검색 결과에 명시된 경우에만 사용한다.
-6. 여러 검색 결과가 있을 경우, 공통적으로 일치하는 정보만 사용한다.
-7. 사용자의 이전 대화 맥락은 질문 의도 파악에만 사용하고, 지식 보완에는 사용하지 않는다.
-8. 반드시 한국어로 간결하고 명확하게 답변한다.
-
-## Output Style
-- 불필요한 서론 없이 핵심 정보 위주로 작성
-- 검색 결과 기반 사실 서술 위주
-- 의견, 평가, 해석 표현 금지
+- 사용자의 이전 메시지 정보 및 주어진 Reference 정보를 활용하여 간결하게 답변을 생성한다.
+- 주어진 검색 결과 정보로 대답할 수 없는 경우는 정보가 부족해서 답을 할 수 없다고 대답한다.
+- 한국어로 답변을 생성한다.
 """
 
 persona_function_calling = """
-## Role: 지식 전문가 (Strict Search-first Agent)
-
-## Core Rule
-- 지식, 사실, 개념, 정의, 비교, 현황, 원인, 통계, 기술 설명이 포함된 질문은
-  반드시 search API를 호출해야 한다.
-- search 없이 직접 답변하는 것을 금지한다.
+## Role: 과학 상식 전문가
 
 ## Instruction
-1. 사용자의 질문이 다음 중 하나라도 포함하면 반드시 search API를 호출한다:
-   - 사실 확인 (What / When / Who / Why / How)
-   - 개념 설명, 정의, 원리
-   - 기술, 모델, 알고리즘, 논문, 제품, 회사, 정책
-   - 수치, 통계, 성능 비교, 동향
-2. search API 호출 후에만 답변 생성이 가능하다.
-3. search 결과가 없거나 불충분한 경우:
-   - search 결과가 부족함을 명확히 알리고 답변을 중단한다.
-4. search 결과를 통해서만 답변하며, LLM의 내부 지식은 보조적으로도 사용하지 않는다.
-5. 지식과 무관한 대화(인사, 감정 표현, 요청 확인 등)는 자연스럽게 응답한다.
-
-## Forbidden
-- "일반적으로", "보통", "알려져 있다" 등의 표현 사용 금지
-- search 결과에 없는 배경 설명 추가 금지
-- LLM 추론 기반 보완 설명 금지
+- 사용자가 대화를 통해 과학 지식에 관한 주제로 질문하면 search api를 호출할 수 있어야 한다.
+- 과학 상식과 관련되지 않은 나머지 대화 메시지에는 적절한 대답을 생성한다.
 """
 
 tools = [
@@ -343,16 +303,35 @@ tools = [
 
 
 # =========================
-# 7) RAG 파이프라인 (Hybrid + Rerank)
+# 7) RAG 파이프라인 (Hybrid + ✅RRF + Rerank)
 # =========================
-def hybrid_search_with_rerank(query: str, k_final: int = 5, bm25_k: int = 50, knn_k: int = 50) -> Tuple[List[str], List[Dict[str, Any]]]:
+def hybrid_search_with_rerank(
+    query: str,
+    k_final: int = 3,
+    bm25_k: int = 50,
+    knn_k: int = 50,
+    rrf_k: int = 60,
+    rrf_limit: int = 120,
+    w_bm25: float = 1.0,
+    w_knn: float = 1.0
+) -> Tuple[List[str], List[Dict[str, Any]]]:
     bm25 = sparse_retrieve(query, size=bm25_k)
     knn = dense_retrieve(query, size=knn_k)
 
     bm25_hits = bm25["hits"]["hits"]
     knn_hits = knn["hits"]["hits"]
 
-    candidates = merge_hits(bm25_hits, knn_hits, limit=120)
+    # ✅ RRF로 후보 결합
+    candidates = rrf_merge_hits(
+        bm25_hits=bm25_hits,
+        knn_hits=knn_hits,
+        limit=rrf_limit,
+        k=rrf_k,
+        w_bm25=w_bm25,
+        w_knn=w_knn
+    )
+
+    # reranker로 최종 정렬
     reranked = rerank(query, candidates, topn=40)
 
     topk_docids, references = select_topk_docids(reranked, k_doc=k_final)
@@ -382,14 +361,21 @@ def answer_question(messages: List[Dict[str, str]]) -> Dict[str, Any]:
         function_args = json.loads(tool_call.function.arguments)
         standalone_query = function_args.get("standalone_query", "")
 
-        # ✅ Hybrid + Rerank 검색
-        topk_docids, references = hybrid_search_with_rerank(standalone_query, k_final=10, bm25_k=50, knn_k=50)
+        topk_docids, references = hybrid_search_with_rerank(
+            standalone_query,
+            k_final=3,
+            bm25_k=50,
+            knn_k=50,
+            rrf_k=60,
+            rrf_limit=120,
+            w_bm25=1.0,
+            w_knn=1.0
+        )
 
         response["standalone_query"] = standalone_query
         response["topk"] = topk_docids
         response["references"] = references
 
-        # LLM에 넘길 컨텍스트(선택된 references의 content만)
         retrieved_context = [r["content"] for r in references]
         content = json.dumps(retrieved_context, ensure_ascii=False)
 
@@ -416,7 +402,7 @@ def answer_question(messages: List[Dict[str, str]]) -> Dict[str, Any]:
 
 
 def eval_rag(eval_filename: str, output_filename: str):
-    with open(eval_filename) as f, open(output_filename, "w") as of:
+    with open(eval_filename, "r", encoding="utf-8") as f, open(output_filename, "w", encoding="utf-8") as of:
         idx = 0
         for line in f:
             j = json.loads(line)
@@ -439,37 +425,29 @@ def eval_rag(eval_filename: str, output_filename: str):
 # 8) 실행부: (재)색인 + 평가
 # =========================
 if __name__ == "__main__":
-    # 1) 인덱스 생성
     create_es_index(ES_INDEX, settings, mappings)
 
-    # 2) 원문 로드
     with open("../data/documents.jsonl", "r", encoding="utf-8") as f:
         raw_docs = [json.loads(line) for line in f]
 
-    # 3) ✅ 청킹
     chunked_docs = make_chunk_docs(raw_docs, chunk_size=700, chunk_overlap=150)
     print(f"raw docs: {len(raw_docs)} -> chunked docs: {len(chunked_docs)}")
 
-    # 4) ✅ chunk 단위 임베딩 생성
     embeddings = get_embeddings_in_batches(chunked_docs, batch_size=128)
 
-    # 5) ES 색인용 문서 구성
     index_docs = []
     for doc, emb in zip(chunked_docs, embeddings):
         doc["embeddings"] = emb
         index_docs.append(doc)
 
-    # 6) bulk indexing
     ret = bulk_add(ES_INDEX, index_docs)
     print(ret)
 
-    # (선택) 간단 검색 테스트
     test_query = "금성이 다른 행성들보다 밝게 보이는 이유는 무엇인가요?"
-    topk, refs = hybrid_search_with_rerank(test_query, k_final=10, bm25_k=20, knn_k=20)
+    topk, refs = hybrid_search_with_rerank(test_query, k_final=3, bm25_k=20, knn_k=20)
     print("TOPK docids:", topk)
     for r in refs:
         print("rerank_score:", r["score"], "chunk_id:", r["chunk_id"])
         print("content:", r["content"][:200], "...\n")
 
-    # 7) 평가 실행
     eval_rag("../data/eval.jsonl", "sample_submission.csv")
